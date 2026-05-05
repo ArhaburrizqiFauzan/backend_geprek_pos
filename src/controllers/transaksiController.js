@@ -1,10 +1,8 @@
 const db = require('../config/database');
 
-// POST /api/transaksi — buat transaksi baru
 const createTransaksi = async (req, res) => {
   const { payment_method, cash_received, notes, items } = req.body;
 
-  // Validasi input
   if (!payment_method || !items || items.length === 0) {
     return res.status(400).json({ success: false, message: 'Metode pembayaran dan item wajib diisi' });
   }
@@ -18,8 +16,8 @@ const createTransaksi = async (req, res) => {
   }
 
   try {
-    // Hitung total & validasi stok
     let total_amount = 0;
+
     for (const item of items) {
       const [rows] = await db.query(
         `SELECT id, name, price, stock FROM menu_items WHERE id = ?`,
@@ -36,12 +34,21 @@ const createTransaksi = async (req, res) => {
         return res.status(400).json({ success: false, message: `Stok ${menu.name} tidak mencukupi` });
       }
 
-      item.unit_price = parseFloat(menu.price);
+      // Hitung extras dari FE
+      const extrasTotal = item.extras
+        ? (item.extras.nasi * 4000) +
+          (item.extras.telur * 3000) +
+          (item.extras.tempe * 1000) +
+          (item.extras.tahu * 1000)
+        : 0;
+
+      const spicyExtra = (item.spicy_level ?? 0) >= 4 ? 1000 : 0;
+
+      item.unit_price = parseFloat(menu.price) + extrasTotal + spicyExtra;
       item.subtotal = item.unit_price * item.quantity;
       total_amount += item.subtotal;
     }
 
-    // Validasi uang tunai cukup
     if (payment_method === 'tunai' && parseFloat(cash_received) < total_amount) {
       return res.status(400).json({ success: false, message: 'Jumlah uang tidak mencukupi' });
     }
@@ -56,17 +63,32 @@ const createTransaksi = async (req, res) => {
       ? parseFloat(cash_received) - total_amount
       : null;
 
-    // Insert transaksi
     const transactionId = await db.query(`SELECT UUID() as id`).then(([r]) => r[0].id);
+
+    // Simpan detail kustomisasi per item sebagai JSON di notes transaksi
+    const itemDetails = items.map(item => ({
+      menu_item_id: item.menu_item_id,
+      quantity: item.quantity,
+      part: item.part || null,
+      spicy_level: item.spicy_level || null,
+      is_separated: item.is_separated ?? null,
+      extras: item.extras || null,
+      notes: item.item_notes || null,
+    }));
+
+    const transactionNotes = JSON.stringify({
+      custom_notes: notes || null,
+      item_details: itemDetails,
+    });
 
     await db.query(
       `INSERT INTO transactions (id, transaction_code, cashier_id, total_amount, payment_method, cash_received, change_amount, notes)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       [transactionId, transaction_code, req.user.id, total_amount, payment_method,
-       cash_received || null, change_amount, notes || null]
+       cash_received || null, change_amount, transactionNotes]
     );
 
-    // Insert order items + dekrementasi stok
+    // Insert order_items + dekrementasi stok
     for (const item of items) {
       await db.query(
         `INSERT INTO order_items (id, transaction_id, menu_item_id, quantity, unit_price, subtotal)
@@ -79,7 +101,6 @@ const createTransaksi = async (req, res) => {
         [item.quantity, item.menu_item_id]
       );
 
-      // Auto nonaktifkan kalau stok habis
       await db.query(
         `UPDATE menu_items SET is_available = 0 WHERE id = ? AND stock = 0`,
         [item.menu_item_id]
@@ -104,12 +125,9 @@ const createTransaksi = async (req, res) => {
   }
 };
 
-// GET /api/transaksi — ambil semua transaksi (pemilik only)
 const getAllTransaksi = async (req, res) => {
   try {
-    const [rows] = await db.query(
-      `SELECT * FROM v_detail_transaksi`
-    );
+    const [rows] = await db.query(`SELECT * FROM v_detail_transaksi`);
     res.json({ success: true, data: rows });
   } catch (err) {
     console.error('getAllTransaksi error:', err);
